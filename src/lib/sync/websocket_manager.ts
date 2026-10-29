@@ -15,6 +15,24 @@ import { $ } from "../../i18n/lang";
 // 冲突相关错误码
 const ERROR_SYNC_CONFLICT = 530;
 
+// 收到后会按 path 释放并发槽位的 ACK；上下文不匹配被丢弃时也必须释放
+// ACKs that release a slot by path; they must still release it when discarded for a context mismatch
+const SLOT_RELEASING_ACKS = new Set<string>([
+  WSAction.FileUploadAck,
+  WSAction.FileDeleteAck,
+  WSAction.NoteModifyAck,
+  WSAction.NoteDeleteAck,
+  WSAction.SettingModifyAck,
+  WSAction.SettingDeleteAck,
+]);
+
+// 不带 path、按 FIFO 释放槽位的 ACK（重命名）
+// ACKs without a path that release slots in FIFO order (rename)
+const FIFO_SLOT_RELEASING_ACKS = new Set<string>([
+  WSAction.FileRenameAck,
+  WSAction.NoteRenameAck,
+]);
+
 const AUTH_ERROR_REIMPORT_CODES = new Set([307, 308, 309, 310]);
 
 const AUTH_ERROR_FALLBACK_MESSAGES: Record<number, string> = {
@@ -308,6 +326,10 @@ export class WebSocketManager {
         return;
       } else {
         this.client.isAuth = true;
+        // 重连授权成功：回收断线期间获取、且永远等不到 ACK 的并发槽位，并放行排队任务
+        // Authorized (again): reclaim slots taken while disconnected (their messages were dropped, no ACK will come)
+        // and grant queued waiters; must run before the sync starts
+        this.plugin.concurrencyLimiter.resetActive();
         const paths = (data.data?.["paths"] as string[]) || [];
         this.plugin.shareIndicatorManager?.updateSharedPaths(paths);
         if (data.data) {
@@ -418,6 +440,18 @@ export class WebSocketManager {
         const isControlMsg = msgAction === WSAction.ClientReceiveAuth || msgAction === WSAction.ClientReceiveInfo;
         if (!isControlMsg && data.context !== this.plugin.syncState.activeSyncContext) {
           dump(`[SyncContext] Discard message ${msgAction} due to mismatched context. Expected: ${this.plugin.syncState.activeSyncContext}, Got: ${data.context}`);
+          // 被丢弃的 ACK 仍需释放其占用的并发槽位，否则槽位永远不会归还
+          // A discarded ACK must still release the slot it would have freed, otherwise the slot leaks
+          if (SLOT_RELEASING_ACKS.has(msgAction)) {
+            const ackPath = data.data?.path;
+            if (typeof ackPath === "string") {
+              this.plugin.concurrencyLimiter.releaseSlot(ackPath);
+            }
+          } else if (FIFO_SLOT_RELEASING_ACKS.has(msgAction)) {
+            // 重命名 ACK 不带 path，按 FIFO 释放最早的槽位
+            // Rename ACKs carry no path; release the oldest FIFO slot
+            this.plugin.concurrencyLimiter.releaseFifoSlot();
+          }
           return;
         }
       }

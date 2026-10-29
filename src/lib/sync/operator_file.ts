@@ -19,7 +19,33 @@ const activeUploadsMap = new Map<string, { cancelled: boolean }>()
 export let isPluginUnloading = false;
 
 // 会话 ID 到文件路径的映射，用于处理 463 会话不存在错误
-const sessionIdToPathMap = new Map<string, string>()
+// 条目在 FileUploadAck / 463 处理时删除，并按时间戳兜底清理（见 rememberUploadSession）
+// Session ID -> path map for handling 463 session-not-found errors.
+// Entries are removed on FileUploadAck / 463 handling, with timestamp-based pruning as a fallback (see rememberUploadSession)
+const sessionIdToPathMap = new Map<string, { path: string; ts: number }>()
+const SESSION_MAP_TTL_MS = 24 * 60 * 60 * 1000
+
+/**
+ * 记录会话映射，并清理超过 24 小时的旧条目，避免 Map 无限增长
+ * Record a session mapping and prune entries older than 24h so the map cannot grow forever
+ */
+const rememberUploadSession = (sessionId: string, path: string) => {
+  const now = Date.now()
+  for (const [id, entry] of sessionIdToPathMap) {
+    if (now - entry.ts > SESSION_MAP_TTL_MS) sessionIdToPathMap.delete(id)
+  }
+  sessionIdToPathMap.set(sessionId, { path, ts: now })
+}
+
+/**
+ * 按路径删除会话映射（FileUploadAck 不带 sessionId）
+ * Delete session mappings by path (FileUploadAck carries no sessionId)
+ */
+const forgetUploadSessionsByPath = (path: string) => {
+  for (const [id, entry] of sessionIdToPathMap) {
+    if (entry.path === path) sessionIdToPathMap.delete(id)
+  }
+}
 
 // 大文件跳过同步通知去重：本会话内已提示过的 "path|size"，避免同一文件每轮同步重复弹 toast
 const sessionLargeFileNotified = new Set<string>()
@@ -460,7 +486,7 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
     return
   }
   dump(`Receive file need upload (queued): `, data.path, data.sessionId)
-  sessionIdToPathMap.set(data.sessionId, data.path)
+  rememberUploadSession(data.sessionId, data.path)
 
   const file = plugin.app.vault.getFileByPath(normalizePath(data.path))
   if (!file) {
@@ -644,6 +670,9 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
             status: 'pending',
             message: '连接已断开，等待重连后续传'
           });
+          // 释放并发槽位：分片未发出，不会有 ACK 回来，否则槽位会一直被占用
+          // Release the slot: the chunk was never sent so no ACK will arrive; otherwise the slot leaks
+          plugin.concurrencyLimiter.releaseSlot(data.path);
           return;
         }
 
@@ -713,8 +742,9 @@ export const receiveFileUpload = async function (data: FileUploadMessage, plugin
       plugin.recordSyncCompleted('file', data.pageIndex)
     } finally {
       // 任务结束（完成或取消/失败），移除活跃标记
+      // sessionIdToPathMap 不在此处删除：最后一块发送后服务端仍可能返回 463 等错误，需据此释放槽位
+      // sessionIdToPathMap is NOT cleared here: the server may still return 463 etc. after the last chunk is sent
       activeUploadsMap.delete(data.path);
-      sessionIdToPathMap.delete(data.sessionId);
     }
   }
 
@@ -1488,6 +1518,9 @@ export const receiveFileUploadAck = function (data: { lastTime?: number; path?: 
   }
   if (data.path) {
     plugin.concurrencyLimiter.releaseSlot(data.path)
+    // 上传已确认，会话映射不再需要
+    // Upload acknowledged, the session mapping is no longer needed
+    forgetUploadSessionsByPath(data.path)
   }
   // 查表归账所属下载页（NeedPush=FileUpload 驱动）；查不到说明是本地用户自发编辑触发的上传 Ack，走旧路径
   // Look up the owning download page (NeedPush=FileUpload-driven); a miss means a local
@@ -1516,8 +1549,12 @@ export const receiveFileDeleteAck = function (data: { lastTime?: number; path?: 
  * 收到服务端 463 错误（上传附件会话不存在），清理该文件的活跃上传状态并增加完成计数
  */
 export const receiveFileUploadSessionNotFound = function (sessionId: string, plugin: FastSync) {
-  const path = sessionIdToPathMap.get(sessionId)
-  if (path) {
+  const entry = sessionIdToPathMap.get(sessionId)
+  if (entry) {
+    const path = entry.path
+    // 幂等：服务端可能对同一会话的每个分片都返回 463，仅处理第一次
+    // Idempotent: the server may return 463 once per chunk for the same session; handle only the first
+    sessionIdToPathMap.delete(sessionId)
     const active = activeUploadsMap.get(path)
     if (active) {
       active.cancelled = true

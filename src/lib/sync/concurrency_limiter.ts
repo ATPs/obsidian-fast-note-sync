@@ -7,7 +7,9 @@ import { dump } from "../utils/helpers";
  */
 export class ConcurrencyLimiter {
     private plugin: FastSync;
-    private queue: { key: string; priority: number; resolve: () => void }[] = [];
+    // grant: 占用槽位后放行；abandon: 不占用槽位直接放行（用于 clear，避免重新占满槽位）
+    // grant: take the slot, then resolve; abandon: resolve without taking a slot (used by clear)
+    private queue: { key: string; priority: number; grant: () => void; abandon: () => void }[] = [];
     private activeKeys: Set<string> = new Set();
     
     // 针对 FIFO 类型的 ACK（如重命名消息），记录其对应的 Key 顺序
@@ -40,10 +42,14 @@ export class ConcurrencyLimiter {
             this.queue.push({
                 key,
                 priority,
-                resolve: () => {
+                grant: () => {
                     this.activeKeys.add(key);
                     if (isFifo) this.fifoKeys.push(key);
                     dump(`Concurrency: Slot acquired from queue for ${key}. Active: ${this.activeKeys.size}`);
+                    resolve();
+                },
+                abandon: () => {
+                    dump(`Concurrency: Task ${key} released from queue without a slot.`);
                     resolve();
                 }
             });
@@ -105,7 +111,7 @@ export class ConcurrencyLimiter {
             const next = this.queue.shift();
             if (next) {
                 dump(`Concurrency: Resuming task ${next.key} from queue.`);
-                next.resolve();
+                next.grant();
             }
         }
     }
@@ -121,9 +127,24 @@ export class ConcurrencyLimiter {
         // resolve 后任务会因连接已断开而自然失败，走 catch/finally 释放锁）
         const pending = this.queue;
         this.queue = [];
+        // 注意：必须放弃（不占槽位）而不是授予，否则会把刚清空的 activeKeys 重新占满
+        // Note: abandon (take no slot) rather than grant, otherwise activeKeys would be re-filled right after clearing
         for (const item of pending) {
-            item.resolve();
+            item.abandon();
         }
+    }
+
+    /**
+     * 重连授权成功后重置：丢弃所有活跃槽位，并按上限放行排队任务
+     * 断线期间获取槽位的任务，其消息会被 Send 丢弃，永远不会收到 ACK，因此需要在重连后回收
+     * Reset after a successful (re)authorization: drop all active slots and grant queued waiters up to the limit.
+     * Tasks that took a slot while disconnected had their messages dropped by Send and will never get an ACK.
+     */
+    public resetActive(): void {
+        dump(`Concurrency: Reset ${this.activeKeys.size} active slots, ${this.queue.length} queued tasks.`);
+        this.activeKeys.clear();
+        this.fifoKeys = [];
+        this.processQueue();
     }
 
 }
